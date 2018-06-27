@@ -59,8 +59,25 @@ function require {
 function logs_link {
     local service_name=$1
     local task_id=$(echo $2 | cut -d / -f 2)
-    local logs_name=$(echo $service_name | cut -d \- -f 1)
-    echo "https://eu-west-1.console.aws.amazon.com/cloudwatch/home?region=eu-west-1#logEventViewer:group=awslogs-${logs_name};stream=${service_name}/${service_name}/${task_id}"
+
+    local log_config=$($AWS_ECS describe-task-definition --task-definition ${TASK_DEFINITION} | jq ".taskDefinition.containerDefinitions | map(select(.name == \"${CONTAINER_NAME}\"))[0].logConfiguration")
+    local driver=$(echo $log_config | jq '.logDriver' | cut -d'"' -f2)
+
+    if [ $driver != "awslogs" ]; then
+        echo "Not configured to be logged in CloudWatch"
+        return
+    fi
+
+    local region=$(echo $log_config | jq '.options["awslogs-region"]')
+    if [ -z $region ]; then
+        region=$($AWS_CLI configure get region || echo "us-east-1")
+    fi
+
+    region=$(echo $region | cut -d'"' -f2)
+    local log_group=$(echo $log_config | jq '.options["awslogs-group"]' | cut -d'"' -f2)
+    local prefix=$(echo $log_config | jq '.options["awslogs-stream-prefix"]' | cut -d'"' -f2)
+
+    echo "https://$region.console.aws.amazon.com/cloudwatch/home?region=$region#logEventViewer:group=${log_group};stream=${prefix}/${service_name}/${task_id}"
 }
 
 # Check for AWS, AWS Command Line Interface
@@ -75,13 +92,7 @@ CONTAINER_NAME=false
 COMMAND=false
 VERBOSE=false
 TAGVAR=false
-AWS_CLI=$(which aws)
-if [ -n "$DRY_RUN" ]; then
-    AWS_ECS="echo $AWS_CLI --output json ecs"
-else
-    AWS_ECS="$AWS_CLI --output json ecs"
-fi
-
+AWS_CLI="$(which aws) --output json"
 
 DESIRED=1
 
@@ -179,12 +190,18 @@ fi
 if [ -z ${AWS_DEFAULT_REGION+x} ]; then
     unset AWS_DEFAULT_REGION
 else
-    AWS_ECS="$AWS_ECS --region $AWS_DEFAULT_REGION"
+    AWS_CLI="$AWS_CLI --region $AWS_DEFAULT_REGION"
 fi
 if [ -z ${AWS_PROFILE+x} ]; then
     unset AWS_PROFILE
 else
-    AWS_ECS="$AWS_ECS --profile $AWS_PROFILE"
+    AWS_CLI="$AWS_CLI --profile $AWS_PROFILE"
+fi
+
+if [ -n "$DRY_RUN" ]; then
+    AWS_ECS="echo $AWS_CLI ecs"
+else
+    AWS_ECS="$AWS_CLI ecs"
 fi
 
 run_task () {
@@ -224,7 +241,7 @@ while [ "$RETRIES" -lt $MAX_RETRIES ] && [ $DO_RETRY -eq 1 ]; do
 
         if [ $WAITER_EXIT_CODE -eq 0 ]; then
             DESCRIBE_TASKS=$($AWS_ECS describe-tasks --tasks "$TASK_ARN" --cluster $CLUSTER)
-            EXIT_CODE=$(echo $DESCRIBE_TASKS | jq '.tasks[0].containers[0].exitCode')
+            EXIT_CODE=$(echo $DESCRIBE_TASKS | jq ".tasks[0].containers | map(select(.name == \"${CONTAINER_NAME}\"))[0].exitCode")
             if [ $EXIT_CODE -eq 0 ]; then
               _echo "ECS task exited successfully"
               _echo $(logs_link $CONTAINER_NAME $TASK_ARN)
